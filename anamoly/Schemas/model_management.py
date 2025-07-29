@@ -1,5 +1,6 @@
 # other_processes_server/schemas/model_management.py
-from pydantic import BaseModel
+from typing import Optional, Literal
+from pydantic import BaseModel, Field, root_validator
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 
@@ -32,12 +33,56 @@ class ModelInfo(BaseModel):
 
 
 class TrainModelRequest(BaseModel):
-    """Request body for training a new anomaly detection model."""
-    data_source_path: str = "data/DCS1-Ares_metrics.csv" 
-    model_id: Optional[str] = None 
-    algorithm: str = "GMM" 
-    n_components: int = 4 
-    anomaly_threshold_percentile: float = 0.95 
+    """
+    Request body for training a new anomaly‑detection model.
+    - Either supply `n_components` manually,
+      OR set `auto_n_components=True` to let the server choose.
+    """
+    # Path to CSV on disk (required)
+    data_source_path: str = Field(..., example="data/DCS1-Ares_metrics.csv")
+
+    # Optional user‑defined model identifier
+    model_id: Optional[str] = Field(
+        default=None, example="gmm_model_2025_july"
+    )
+
+    # Only 'gmm' supported for now (case‑insensitive)
+    algorithm: Literal["gmm", "GMM"] = "gmm"
+
+    # Manual K (optional if auto_n_components=True)
+    n_components: Optional[int] = Field(
+        default=None, ge=1, example=4,
+        description="Number of Gaussian components (ignored when auto_n_components=True)"
+    )
+
+    # Turn on auto‑K selection via AIC/BIC
+    auto_n_components: bool = Field(
+        default=False,
+        description="If True, server will pick the best K using `criterion`"
+    )
+
+    # Which metric to minimise when auto‑selecting K
+    criterion: Literal["bic", "aic"] = Field(
+        default="bic", description="Metric used when auto_n_components=True"
+    )
+
+    # Percentile for anomaly threshold
+    anomaly_threshold_percentile: float = Field(
+        default=0.95, ge=0.0, le=1.0,
+        description="Top‑percentile scores flagged as anomalies (0–1)"
+    )
+
+    @root_validator
+    def check_k_or_auto(cls, values):
+        """Ensure either n_components is provided OR auto_n_components is True."""
+        n_components = values.get("n_components")
+        auto_flag   = values.get("auto_n_components")
+        if not auto_flag and n_components is None:
+            raise ValueError(
+                "Either `n_components` must be supplied, "
+                "or `auto_n_components` must be set to True."
+            )
+        return values
 
 class TrainModelResponse(BaseModel):
     """Response body after training a model."""

@@ -1,0 +1,17 @@
+version: "3.9"
+
+services:
+  anamoly:
+    build: .
+    container_name: anamoly
+    restart: always
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    environment:
+      - PYTHONUNBUFFERED=1
+

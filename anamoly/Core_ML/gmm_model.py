@@ -1,7 +1,7 @@
 from typing import Optional
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
-from sklearn.mixture import GaussianMixture # Changed from KMeans
+from sklearn.mixture import GaussianMixture
 from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt
 import os
@@ -14,11 +14,11 @@ import time
 import joblib # For saving/loading models
 
 # Suppress warnings for cleaner output
-warnings.filterwarnings("ignore", category=UserWarning, module="sklearn.cluster._kmeans") # Still for general clustering warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn.cluster._kmeans")
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 class GMMAnomalyDetector:
-    def __init__(self, output_plot_directory='anomaly_reports', trained_models_directory='trained_models'):
+    def __init__(self, output_plot_directory='anomaly_reports/gmm_model_auto_k', trained_models_directory='trained_models'):
         self.output_plot_directory = output_plot_directory
         self.trained_models_directory = trained_models_directory
         self._ensure_directories()
@@ -43,9 +43,18 @@ class GMMAnomalyDetector:
         exclude_cols.extend(uname_info_cols)
         self.numerical_features = [col for col in numerical_features if col not in exclude_cols]
 
-        # for col in self.numerical_features:
-        #     df[col] = df[col].ffill()
-        #     df[col] = df[col].bfill()
+        # Ensure numerical_features are not empty
+        if not self.numerical_features:
+            raise ValueError("No valid numerical features found after excluding timestamp and _uname_info columns.")
+
+        # Impute missing values if any remain after exclusions
+        for col in self.numerical_features:
+            if df[col].dtype not in ['float64', 'int64']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            df[col] = df[col].ffill()
+            df[col] = df[col].bfill()
+            if df[col].isnull().any(): # Fallback if column was all NaNs
+                df[col] = df[col].fillna(0)
 
         self.scaler = StandardScaler()
         X_scaled = self.scaler.fit_transform(df[self.numerical_features])
@@ -63,7 +72,9 @@ class GMMAnomalyDetector:
             aic_values.append(gmm.aic(df_scaled))
             bic_values.append(gmm.bic(df_scaled))
 
-        # Choose optimal k based on selected criterion
+        if not aic_values or not bic_values:
+            raise ValueError("AIC/BIC values could not be calculated. Check df_scaled content.")
+
         if criterion == 'bic':
             optimal_k = k_range[bic_values.index(min(bic_values))]
         elif criterion == 'aic':
@@ -83,19 +94,30 @@ class GMMAnomalyDetector:
         plt.grid(True)
         plt.xticks(k_range)
         plt.tight_layout()
-        plt.close()
+        plt.close() # Close plot immediately as it's not saved here for later use in model_output_dir
 
         return optimal_k
 
 
-    def train_model(self, df_original: pd.DataFrame, n_components: int, anomaly_threshold_percentile: float = 0.95, model_id: Optional[str] = None):
-        print("Starting model training with GMM...")
-
+    def train_model(
+        self,
+        df_original: pd.DataFrame,
+        n_components: Optional[int] = None,
+        auto_n_components: bool = False,
+        criterion: str = "bic",
+        anomaly_threshold_percentile: float = 0.95,
+        model_id: Optional[str] = None
+    ):
         df_scaled = self.preprocess_data(df_original)
 
+        if auto_n_components:
+            n_components = self.find_optimal_n_components(df_scaled, k_range=range(1, 11), criterion=criterion)
+            print(f"Auto-selected n_components: {n_components} using {criterion.upper()}")
+        elif n_components is None:
+            raise ValueError("n_components must be provided unless auto_n_components is True.")
+        
         # Generate a model_id if not provided
         if model_id is None:
-            # Hash of current timestamp and n_components for a unique ID
             self.model_id = hashlib.sha256(f"{time.time()}-{n_components}".encode()).hexdigest()[:10]
         else:
             self.model_id = model_id
@@ -138,8 +160,19 @@ class GMMAnomalyDetector:
 
         # --- Anomaly Detection and Metric Attribution ---
         # Anomaly scores based on negative log-likelihood
-        anomaly_scores = -self.gmm_model.score_samples(df_scaled[self.numerical_features])
-        df_original['Anomaly_Score'] = anomaly_scores
+        log_likelihoods = self.gmm_model.score_samples(df_scaled[self.numerical_features])
+        df_original['Log_Likelihood'] = log_likelihoods
+        df_original['Anomaly_Score'] = -log_likelihoods # Consistent with previous definition
+        df_original['Probability_Density'] = np.exp(log_likelihoods) # Add probability density
+
+        # Get cluster responsibilities for Assigned_Cluster_Probability
+        cluster_responsibilities = self.gmm_model.predict_proba(df_scaled[self.numerical_features])
+        # Get the probability for the assigned cluster for each data point
+        df_original['Assigned_Cluster_Probability'] = [
+            cluster_responsibilities[i, cluster_labels[i]] for i in range(len(df_original))
+        ]
+
+
         df_original['Is_Anomaly'] = False # Initialize
 
         self.anomaly_threshold = df_original['Anomaly_Score'].quantile(anomaly_threshold_percentile)
@@ -153,7 +186,11 @@ class GMMAnomalyDetector:
             for i, anomaly_row_original in anomalies_df.iterrows():
                 anomaly_timestamp = anomaly_row_original['timestamp']
                 anomaly_score = anomaly_row_original['Anomaly_Score']
+                log_likelihood = anomaly_row_original['Log_Likelihood']
+                probability_density = anomaly_row_original['Probability_Density']
                 cluster_id = anomaly_row_original['Cluster'] # Most probable component
+                assigned_cluster_prob = anomaly_row_original['Assigned_Cluster_Probability']
+
 
                 if i in df_scaled.index:
                     anomaly_row_scaled = df_scaled.loc[i][self.numerical_features].astype(float)
@@ -171,14 +208,20 @@ class GMMAnomalyDetector:
                     all_anomaly_details.append({
                         'Timestamp': anomaly_timestamp,
                         'Anomaly_Score': anomaly_score,
+                        'Log_Likelihood': round(log_likelihood, 4), # New
+                        'Probability_Density': f"{probability_density:.4e}", # New, scientific notation
                         'Cluster': cluster_id,
+                        'Assigned_Cluster_Probability': round(assigned_cluster_prob, 4), # New
                         'Metric': metric,
                         'Scaled_Deviation': round(dev_score, 4),
                         'Original_Value': round(original_value, 2) if pd.notnull(original_value) else 'NA'
                     })
 
-        output_csv_path = os.path.join(model_output_dir, 'all_anomalies_with_top5_metrics.csv')
-        keys = ['Timestamp', 'Anomaly_Score', 'Cluster', 'Metric', 'Scaled_Deviation', 'Original_Value']
+        output_csv_path = 'C:/Users/sathy\Downloads/Anomaly_MCP_Servers/Anomaly_MCP_Servers/anomaly_reports/gmm_model_auto_k/all_anomalies_with_top5_metrics.csv'
+        keys = [
+            'Timestamp', 'Anomaly_Score', 'Log_Likelihood', 'Probability_Density',
+            'Cluster', 'Assigned_Cluster_Probability', 'Metric', 'Scaled_Deviation', 'Original_Value'
+        ]
 
         with open(output_csv_path, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=keys)
@@ -189,13 +232,9 @@ class GMMAnomalyDetector:
         # --- Generate Plots ---
         plots_generated = []
         # Plot 1: AIC/BIC plot (already generated by find_optimal_n_components)
-        # We need to call it if it wasn't called before or ensure it's saved to the model_output_dir
-        aic_bic_plot_path, _, _ = self.find_optimal_n_components(df_scaled, k_range=range(1, 11))
-        # Ensure it's moved/copied to the model-specific directory
-        final_aic_bic_path = os.path.join(model_output_dir, os.path.basename(aic_bic_plot_path))
-        if aic_bic_plot_path != final_aic_bic_path:
-             os.rename(aic_bic_plot_path, final_aic_bic_path) # Move it to the specific model folder
-        plots_generated.append(final_aic_bic_path)
+        # The function finds and plots, but does not save to specific model_output_dir.
+        # It's generated implicitly by calling find_optimal_n_components if auto_n_components is True.
+        # The plot itself is closed inside find_optimal_n_components.
 
 
         # Plot 2: Cluster Visualization (PCA)
