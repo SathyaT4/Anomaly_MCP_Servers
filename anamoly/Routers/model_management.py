@@ -1,15 +1,20 @@
 # other_processes_server/routers/model_management.py
+import ast
 import base64
 import datetime
 import io
 import os
+import plotly.graph_objects as go
 import shutil
+import uuid
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 from matplotlib import cm, pyplot as plt
 from pydantic import BaseModel, Field
 import regex as re
 import pandas as pd
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status, Request # Import Request
+from fastapi import APIRouter, Body, Depends, FastAPI, File, HTTPException, Query, UploadFile, status, Request # Import Request
 from typing import List, Literal, Optional, Dict, Any, Union # Ensure Dict and Any are imported for broadcast data
 import json # Import json for sending data over WebSocket
 
@@ -63,234 +68,306 @@ UPLOADED_DATA_DIR = "../uploaded_data"
 if not os.path.exists(UPLOADED_DATA_DIR):
     os.makedirs(UPLOADED_DATA_DIR)
 
-REPORTS_BASE_DIR = "anamoly/anomaly_reports/gmm_model_auto_k"
+REPORTS_BASE_DIR = "../anomaly_reports/gmm_model_auto_k"
 if not os.path.exists(REPORTS_BASE_DIR):
     os.makedirs(REPORTS_BASE_DIR)
 
 
-
-
-@router.get("/get_context")
-async def get_combined_anomaly_and_dataset(
-    start_datetime: Optional[datetime.datetime] = Query(None, description="Start date and time for filtering (e.g., 2025-07-20T10:00:00Z)"),
-    end_datetime: Optional[datetime.datetime] = Query(None, description="End date and time for filtering (e.g., 2025-07-21T12:00:00Z)")
-):
+def process_datetime_for_utc(dt_str: Optional[str]) -> Optional[datetime.datetime]:
     """
-    Retrieves both the structured anomaly report JSON and the raw dataset content (as JSON).
-    Can filter results by a specified date and time range using 'start_datetime' and 'end_datetime' query parameters.
+    Processes a datetime string, attempting to parse it and convert to UTC.
+    Handles 'YYYY-MM-DDTHH:MM:SS' or 'YYYY-MM-DD' formats.
     """
-    print(f"Received request for /get_context:")
-    print(f"  start_datetime (raw query): {start_datetime}")
-    print(f"  end_datetime (raw query): {end_datetime}")
-
-    # Initialize processed datetime variables at the top of the function
-    # This prevents NameError if start_datetime or end_datetime are None
-    processed_start_datetime = None
-    processed_end_datetime = None
-
-    # Process start_datetime and end_datetime for consistent UTC comparison
-    if start_datetime:
-        if start_datetime.tzinfo is None:
-            processed_start_datetime = start_datetime.replace(tzinfo=datetime.timezone.utc)
-            print(f"  start_datetime localized to UTC (from naive): {processed_start_datetime}")
-        else:
-            processed_start_datetime = start_datetime.astimezone(datetime.timezone.utc)
-            print(f"  start_datetime converted to UTC: {processed_start_datetime}")
-
-    if end_datetime:
-        if end_datetime.tzinfo is None:
-            processed_end_datetime = end_datetime.replace(tzinfo=datetime.timezone.utc)
-            print(f"  end_datetime localized to UTC (from naive): {processed_end_datetime}")
-        else:
-            processed_end_datetime = end_datetime.astimezone(datetime.timezone.utc)
-            print(f"  end_datetime converted to UTC: {processed_end_datetime}")
-
-
-    # --- 1. Retrieve and process the Anomaly Report JSON ---
-    anomaly_report_filename = "all_anomalies_with_top5_metrics.csv"
-    anomaly_report_path = 'C:/Users/sathy\Downloads/Anomaly_MCP_Servers/Anomaly_MCP_Servers/anomaly_reports/gmm_model_auto_k/' + anomaly_report_filename
-    anomaly_data_json = []
-
-    print(f"\nChecking for anomaly report at: {anomaly_report_path}")
-    if not os.path.exists(anomaly_report_path) or not os.path.isfile(anomaly_report_path):
-        print(f"Warning: Anomaly report not found at {anomaly_report_path}")
-        # If the anomaly report is essential, consider raising an HTTPException here
-        # raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Anomaly report file not found at {anomaly_report_path}.")
-    else:
-        print(f"Anomaly report found. Attempting to read...")
-        try:
-            df_anomaly = pd.read_csv(anomaly_report_path, on_bad_lines='skip')
-            print(f"Original anomaly dataframe shape: {df_anomaly.shape}")
-
-            if df_anomaly.empty:
-                print("Anomaly report CSV is empty after reading.")
-            elif 'Timestamp' not in df_anomaly.columns:
-                print("Warning: 'Timestamp' column not found in anomaly report CSV. Anomaly filtering will not be applied.")
-            else:
-                # Convert 'Timestamp' column to datetime objects and ensure UTC
-                df_anomaly['Timestamp'] = pd.to_datetime(df_anomaly['Timestamp'])
-                if df_anomaly['Timestamp'].dt.tz is None:
-                    df_anomaly['Timestamp'] = df_anomaly['Timestamp'].dt.tz_localize('UTC')
-                    print("Anomaly Timestamps localized to UTC (from naive).")
-                else:
-                    df_anomaly['Timestamp'] = df_anomaly['Timestamp'].dt.tz_convert('UTC')
-                    print("Anomaly Timestamps converted to UTC (from another timezone).")
-
-                # Apply date and time filtering
-                if processed_start_datetime:
-                    df_anomaly = df_anomaly[df_anomaly['Timestamp'] >= processed_start_datetime]
-                    print(f"Anomaly dataframe shape after start_datetime filter: {df_anomaly.shape}")
-                if processed_end_datetime:
-                    df_anomaly = df_anomaly[df_anomaly['Timestamp'] <= processed_end_datetime]
-                    print(f"Anomaly dataframe shape after end_datetime filter: {df_anomaly.shape}")
-                
-                if df_anomaly.empty:
-                    print("Anomaly dataframe is empty after filtering.")
-                else:
-                    grouped_anomalies = []
-                    for (timestamp, anomaly_score, cluster), group in df_anomaly.groupby(['Timestamp', 'Anomaly_Score', 'Cluster']):
-                        metrics_contribution = []
-                        for _, row in group.iterrows():
-                            metrics_contribution.append({
-                                "Metric": row['Metric'],
-                                "Scaled_Deviation": float(row['Scaled_Deviation']),
-                                "Original_Value": float(row['Original_Value'])
-                            })
-                        
-                        log_likelihood = float(group['Log_Likelihood'].iloc[0])
-                        probability_density = float(group['Probability_Density'].iloc[0])
-                        assigned_cluster_probability = float(group['Assigned_Cluster_Probability'].iloc[0])
-
-                        grouped_anomalies.append({
-                            "Timestamp": timestamp.isoformat(),
-                            "Anomaly_Score": float(anomaly_score),
-                            "Log_Likelihood": log_likelihood,
-                            "Probability_Density": probability_density,
-                            "Cluster": int(cluster),
-                            "Assigned_Cluster_Probability": assigned_cluster_probability,
-                            "Metrics_Contribution": metrics_contribution
-                        })
-                    anomaly_data_json = grouped_anomalies
-                    print(f"Processed {len(anomaly_data_json)} anomaly groups.")
-            
-        except Exception as e:
-            print(f"Error processing anomaly report CSV: {str(e)}")
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error processing anomaly report CSV: {str(e)}")
-
-    # --- 2. Retrieve and process the Dataset JSON ---
-    dataset_file_name = 'DCS1-Ares_metrics.csv'
-    dataset_file_full_path = os.path.join(UPLOADED_DATA_DIR, dataset_file_name)
-    dataset_content_json = []
-
-    print(f"\nChecking for dataset file at: {dataset_file_full_path}")
-    if not os.path.exists(dataset_file_full_path) or not os.path.isfile(dataset_file_full_path):
-        print(f"Error: Dataset file '{dataset_file_name}' not found in uploaded_data at {dataset_file_full_path}.")
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Dataset file '{dataset_file_name}' not found in uploaded_data.")
-    else:
-        print(f"Dataset file found. Attempting to read...")
-        try:
-            df_dataset = pd.read_csv(dataset_file_full_path)
-            print(f"Original dataset dataframe shape: {df_dataset.shape}")
-
-            if df_dataset.empty:
-                print("Dataset CSV is empty after reading.")
-            elif 'timestamp' not in df_dataset.columns: # Note: column name is 'timestamp' here (lowercase 't')
-                print("Warning: 'timestamp' column not found in dataset CSV. Dataset filtering will not be applied.")
-            else:
-                df_dataset['timestamp'] = pd.to_datetime(df_dataset['timestamp'])
-                if df_dataset['timestamp'].dt.tz is None:
-                    df_dataset['timestamp'] = df_dataset['timestamp'].dt.tz_localize('UTC')
-                    print("Dataset Timestamps localized to UTC (from naive).")
-                else:
-                    df_dataset['timestamp'] = df_dataset['timestamp'].dt.tz_convert('UTC')
-                    print("Dataset Timestamps converted to UTC (from another timezone).")
-
-                # Apply date and time filtering to dataset
-                if processed_start_datetime:
-                    df_dataset = df_dataset[df_dataset['timestamp'] >= processed_start_datetime]
-                    print(f"Dataset dataframe shape after start_datetime filter: {df_dataset.shape}")
-                if processed_end_datetime:
-                    df_dataset = df_dataset[df_dataset['timestamp'] <= processed_end_datetime]
-                    print(f"Dataset dataframe shape after end_datetime filter: {df_dataset.shape}")
-
-                if df_dataset.empty:
-                    print("Dataset dataframe is empty after filtering.")
-                else:
-                    # Convert float64 and int64 columns to float for JSON serialization
-                    for col in df_dataset.select_dtypes(include=['int64', 'float64']).columns:
-                        df_dataset[col] = df_dataset[col].astype(float)
-                    
-                    # Convert datetime columns to ISO format for JSON serialization
-                    for col in df_dataset.select_dtypes(include=['datetime64[ns]']).columns:
-                        # Ensure timezone is removed before isoformat for clean output if desired, or keep it
-                        # If you want timezone in output, remove .dt.tz_convert(None)
-                        df_dataset[col] = df_dataset[col].dt.tz_convert(None).dt.isoformat() if df_dataset[col].dt.tz is not None else df_dataset[col].dt.isoformat()
-                    
-                    dataset_content_json = df_dataset.to_dict(orient="records")
-                    print(f"Processed {len(dataset_content_json)} dataset records.")
-        except Exception as e:
-            print(f"Error processing dataset CSV: {str(e)}")
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error processing dataset CSV: {str(e)}")
-
-    # --- 3. Combine and return the response ---
-    print(f"\nFinal anomaly_data_json (first 3 items if any): {anomaly_data_json[:3]}")
-    print(f"Final dataset_content_json (first 3 items if any): {dataset_content_json[:3]}")
+    if not dt_str:
+        return None
     
-    response_content = {
-        "message": "Combined anomaly report and dataset retrieved successfully.",
-        "anomaly_report": anomaly_data_json,
-        # "original_dataset": dataset_content_json # <-- UNCOMMENTED THIS LINE
-    }
-    print(f"\nReturning JSONResponse with {len(anomaly_data_json)} anomaly records and {len(dataset_content_json)} dataset records.")
-    return JSONResponse(content=response_content)
+    try:
+        # Try parsing with seconds precision first (ISO format)
+        dt_obj = datetime.datetime.fromisoformat(dt_str)
+    except ValueError:
+        try:
+            # If that fails, try parsing just date (e.g., 'YYYY-MM-DD')
+            dt_obj = datetime.datetime.strptime(dt_str, '%Y-%m-%d')
+        except ValueError as e:
+            # Re-raise as HTTPException for FastAPI to handle, as this is a client-side input error
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=f"Invalid datetime format: '{dt_str}'. Please use 'YYYY-MM-DDTHH:MM:SS' or 'YYYY-MM-DD'. Error: {e}")
 
+    # If datetime object is naive (no timezone info), assume UTC and localize it.
+    # If it has timezone info, convert it to UTC.
+    if dt_obj.tzinfo is None:
+        return dt_obj.replace(tzinfo=datetime.timezone.utc)
+    else:
+        return dt_obj.astimezone(datetime.timezone.utc)
 
-@router.get("/get_system_context")
-async def get_system_context():
+@router.get("/get_anomaly_summary")
+async def get_detailed_anomaly_summary(
+    start_datetime: Optional[str] = Query(None, description="Start date and time (ISO format: YYYY-MM-DDTHH:MM:SS or YYYY-MM-DD)"),
+    end_datetime: Optional[str] = Query(None, description="End date and time (ISO format: YYYY-MM-DDTHH:MM:SS or YYYY-MM-DD)"),
+    # anomaly_score_threshold: float = Query(0.0, ge=0.0, le=1.0, description="Minimum anomaly score (0.0 to 1.0) to include. Anomalies with lower scores will be filtered out."),
+    max_anomalies_to_return: int = Query(5, ge=1, le=10, description="Maximum number of top-scoring anomalies to return. Prioritizes anomalies with the highest scores."),
+    num_neighboring_points: Optional[int] = Query(2, ge=0, description="Number of neighboring data points (on each side of the anomaly) to include for context. Capped at a maximum of 6 points per side. Defaults to 2. Set to 0 to exclude context data."),
+    metric_filter: Optional[str] = Query(None, description="Comma-separated list of metrics (e.g., 'cpu_usage,memory_utilization') to filter anomalies by. Anomalies must include at least one of these metrics in their top contributions.")
+) -> JSONResponse:
     """
-    Returns the static context about Broadside challenges, solutions, and ServerSage capabilities.
-    This context should be fed to Claude Desktop automatically before any other actions.
+    Retrieves a detailed, summarized report of anomalies from the pre-processed anomaly CSV,
+    including a specified number of neighboring data points from the raw time series data for context,
+    and advanced metric filtering.
+    The response is optimized for LLM consumption, providing expanded insights while aiming for conciseness.
+    
+    Parameters:
+    - start_datetime (Optional[str]): Start date and time in ISO format (e.g., '2025-06-25T10:00:00' or '2025-06-25').
+    - end_datetime (Optional[str]): End date and time in ISO format.
+    - anomaly_score_threshold (float): Minimum anomaly score (0.0 to 1.0) to include.
+    - max_anomalies_to_return (int): Maximum number of top anomalies to return.
+    - num_neighboring_points (Optional[int]): Number of data points to fetch before and after each anomaly's timestamp for context. Max 6 per side. Defaults to 2.
+    - metric_filter (Optional[str]): Comma-separated list of metric names to filter anomalies by.
+    """
+    print(f"[{datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')}] Received request for /get_detailed_anomaly_summary:")
+    print(f"  start_datetime: {start_datetime}")
+    print(f"  end_datetime: {end_datetime}")
+    # print(f"  anomaly_score_threshold: {anomaly_score_threshold}")
+    print(f"  max_anomalies_to_return: {max_anomalies_to_return}")
+    print(f"  num_neighboring_points: {num_neighboring_points}") 
+    print(f"  metric_filter: {metric_filter}")
+
+    # Cap num_neighboring_points at a maximum of 6 as per user's request
+    capped_num_neighboring_points = min(num_neighboring_points if num_neighboring_points is not None else 0, 6)
+
+    processed_start_datetime = process_datetime_for_utc(start_datetime)
+    processed_end_datetime = process_datetime_for_utc(end_datetime)
+
+    # Define paths for the anomaly report and the raw time series data
+    anomaly_report_filename = "all_anomalies_with_top5_metrics.csv"
+    anomaly_report_path = os.path.join(REPORTS_BASE_DIR, anomaly_report_filename)
+    
+    # Using the user-provided DCS1-Ares_metrics.csv as the raw time series data
+    time_series_data_filename = "DCS1-Ares_metrics.csv" 
+    time_series_data_path = os.path.join(UPLOADED_DATA_DIR, time_series_data_filename)
+
+    # --- Validate and Load Anomaly Report ---
+    if not os.path.exists(anomaly_report_path) or not os.path.isfile(anomaly_report_path):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail=f"Anomaly report file not found at '{anomaly_report_path}'. Please ensure anomaly reports are generated and available.")
+    
+    # --- Load Time Series Data for Context (only if neighboring points are requested) ---
+    df_ts = pd.DataFrame()
+    if capped_num_neighboring_points > 0:
+        if not os.path.exists(time_series_data_path) or not os.path.isfile(time_series_data_path):
+            print(f"[{datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')}] Warning: Time series data file not found at '{time_series_data_path}'. Cannot provide context points.")
+            # Do not raise an error; simply proceed without context points if the file is missing
+        else:
+            try:
+                df_ts = pd.read_csv(time_series_data_path, on_bad_lines='skip')
+                if 'timestamp' not in df_ts.columns:
+                    raise ValueError("Time series data CSV missing 'timestamp' column. Cannot align context points.")
+                
+                df_ts['timestamp'] = pd.to_datetime(df_ts['timestamp'])
+                
+                # Localize or convert timestamps to UTC for consistency
+                if df_ts['timestamp'].dt.tz is None:
+                    df_ts['timestamp'] = df_ts['timestamp'].dt.tz_localize('UTC')
+                else:
+                    df_ts['timestamp'] = df_ts['timestamp'].dt.tz_convert('UTC')
+                
+                # Sort time series data by timestamp and reset index for efficient integer-location based slicing
+                df_ts.sort_values(by='timestamp', inplace=True)
+                df_ts.reset_index(drop=True, inplace=True) 
+                
+                print(f"[{datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')}] Successfully loaded time series data with {len(df_ts)} rows.")
+
+            except Exception as e:
+                print(f"[{datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')}] Error loading time series data: {e}")
+                df_ts = pd.DataFrame() # Clear df_ts if loading fails, so context points won't be attempted
+
+    # --- Main Anomaly Report Processing Logic ---
+    try:
+        df_anomaly = pd.read_csv(anomaly_report_path, on_bad_lines='skip')
+        
+        if df_anomaly.empty:
+            return JSONResponse(content={"anomalies": [], "message": "Anomaly report CSV is empty. No anomalies to summarize."})
+        
+        if 'Timestamp' not in df_anomaly.columns:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="Required 'Timestamp' column not found in anomaly report CSV. Cannot process anomalies.")
+        
+        df_anomaly['Timestamp'] = pd.to_datetime(df_anomaly['Timestamp'])
+        if df_anomaly['Timestamp'].dt.tz is None:
+            df_anomaly['Timestamp'] = df_anomaly['Timestamp'].dt.tz_localize('UTC')
+        else:
+            df_anomaly['Timestamp'] = df_anomaly['Timestamp'].dt.tz_convert('UTC')
+
+        # Apply time range filters to anomalies
+        if processed_start_datetime:
+            df_anomaly = df_anomaly[df_anomaly['Timestamp'] >= processed_start_datetime].copy()
+        if processed_end_datetime:
+            df_anomaly = df_anomaly[df_anomaly['Timestamp'] <= processed_end_datetime].copy()
+
+        # Apply anomaly score threshold filter
+        # df_anomaly = df_anomaly[df_anomaly['Anomaly_Score'] >= anomaly_score_threshold].copy()
+        
+        if df_anomaly.empty:
+            return JSONResponse(content={"anomalies": [], "message": "No anomalies found matching the specified time range and score threshold."})
+        
+        # --- Apply Metric Filter ---
+        if metric_filter:
+            allowed_metrics = [m.strip().lower() for m in metric_filter.split(',')]
+            
+            # Helper function to check if anomaly's top metrics (from string representation) contain any of the allowed metrics
+            def contains_any_allowed_metric(top_metrics_str: str, allowed_metrics_list: List[str]) -> bool:
+                if not top_metrics_str or top_metrics_str == "No specific metrics identified":
+                    return False
+                try:
+                    # Safely evaluate the string representation of a list of dictionaries (e.g., "[{'metric': 'cpu', 'deviation': 0.5}]")
+                    metrics_list = ast.literal_eval(top_metrics_str) 
+                    for m_dict in metrics_list:
+                        if m_dict.get('metric') and m_dict['metric'].lower() in allowed_metrics_list:
+                            return True
+                except (ValueError, SyntaxError):
+                    # Fallback for unexpected formats (e.g., if 'Top_Metrics' is just a comma-separated string of names)
+                    for am in allowed_metrics_list:
+                        if am in top_metrics_str.lower(): # Simple substring match
+                            return True
+                return False
+
+            if 'Top_Metrics' not in df_anomaly.columns:
+                print(f"[{datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')}] Warning: 'Top_Metrics' column not found in anomaly report CSV. Cannot apply metric filter.")
+            else:
+                initial_count = len(df_anomaly)
+                df_anomaly = df_anomaly[df_anomaly['Top_Metrics'].astype(str).apply(lambda x: contains_any_allowed_metric(x, allowed_metrics))].copy()
+                print(f"[{datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')}] After metric filter: {len(df_anomaly)} anomalies (from {initial_count})")
+
+        # Re-check if df_anomaly is empty after all filters
+        if df_anomaly.empty:
+            return JSONResponse(content={"anomalies": [], "message": "No anomalies found after applying all specified filters."})
+
+        # --- Optimization: Pre-group and prepare top metrics for each anomaly event ---
+        # Group by the anomaly identifying columns and aggregate relevant metric info
+        # This reduces redundant filtering inside the main loop for 'top_metrics'
+        grouped_anomalies = df_anomaly.groupby(['Timestamp', 'Anomaly_Score', 'Cluster']).apply(
+            # For each group (unique anomaly event), extract top 5 metrics by Scaled_Deviation
+            lambda x: x[['Metric', 'Scaled_Deviation', 'Original_Value']].sort_values(by='Scaled_Deviation', ascending=False).head(5).to_dict(orient='records')
+        ).reset_index(name='top_metrics_data')
+
+        # To get the top N anomalies overall, sort the unique anomaly events by Anomaly_Score
+        grouped_anomalies_sorted = grouped_anomalies.sort_values(by='Anomaly_Score', ascending=False).head(max_anomalies_to_return)
+
+        summarized_anomalies: List[Any] = []
+
+        # Iterate through the pre-grouped and sorted unique anomaly events
+        for index, row in grouped_anomalies_sorted.iterrows():
+            anomaly_timestamp = row['Timestamp']
+            
+            # Format top_metrics_data for the response from the pre-calculated data
+            metrics_contribution_summary = []
+            if row['top_metrics_data']: # Ensure there's data to process
+                for metric_dict in row['top_metrics_data']:
+                    metrics_contribution_summary.append({
+                        "metric": metric_dict['Metric'],
+                        "deviation": round(float(metric_dict['Scaled_Deviation']), 2),
+                        "value": round(float(metric_dict['Original_Value']), 2),
+                    })
+            
+            context_points_data: List[Dict[str, Any]] = []
+
+            # Fetch context data points based on num_neighboring_points if requested and raw data is available
+            if capped_num_neighboring_points > 0 and not df_ts.empty:
+                # Find the insertion point for the anomaly timestamp in the sorted time series data
+                ts_index_loc = df_ts['timestamp'].searchsorted(anomaly_timestamp)
+
+                # Calculate the range of indices for neighboring points
+                start_idx = max(0, ts_index_loc - capped_num_neighboring_points)
+                end_idx = min(len(df_ts), ts_index_loc + capped_num_neighboring_points + 1)
+
+                context_df = df_ts.iloc[start_idx:end_idx].copy()
+                
+                if not context_df.empty:
+                    # Determine which metrics from the raw data are relevant for context
+                    # Prioritize metrics that contributed to the anomaly
+                    relevant_metrics_for_context = [m['metric'] for m in metrics_contribution_summary if m['metric'] in context_df.columns]
+                    
+                    # Fallback: If no top metrics are found in the time series data or if 'top_metrics' was empty,
+                    # include a few common high-level metrics if they exist in the raw data.
+                    if not relevant_metrics_for_context:
+                        common_metrics_candidates = ['node_load1', 'node_memory_MemAvailable_bytes', 
+                                                     'node_network_transmit_bytes_total', 'node_disk_written_bytes_total',
+                                                     'sda_node_disk_read_bytes_total', 'node_sockstat_sockets_used']
+                        # Filter to only columns actually present in the current context_df
+                        relevant_metrics_for_context = [m for m in common_metrics_candidates if m in context_df.columns]
+                    
+                    # Only proceed if there are actual metrics to display in the context
+                    if relevant_metrics_for_context:
+                        for _, ctx_row in context_df.iterrows():
+                            point = {"timestamp": ctx_row['timestamp'].isoformat(timespec='seconds')}
+                            for col in relevant_metrics_for_context:
+                                # Only include if the value is not NaN and round for conciseness
+                                if pd.notna(ctx_row[col]):
+                                    point[col] = round(float(ctx_row[col]), 2)
+                            # Only add the point if it contains more than just the timestamp (i.e., actual metric values)
+                            if len(point) > 1:
+                                context_points_data.append(point)
+                    
+            # Add the summarized anomaly details to the list
+            summarized_anomalies.append({
+                "timestamp": anomaly_timestamp.isoformat(timespec='seconds'),
+                "score": round(float(row['Anomaly_Score']), 4), 
+                # "cluster": int(row['Cluster']),
+                "top_metrics": metrics_contribution_summary if metrics_contribution_summary else "No specific metrics identified",
+                "context_data_points": context_points_data if context_points_data else "No context data points available."
+            })
+            
+            # Stop once the maximum number of desired results are collected
+            if len(summarized_anomalies) >= max_anomalies_to_return:
+                break
+
+        print(f"[{datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')}] Returning {len(summarized_anomalies)} detailed summarized anomalies.")
+        return JSONResponse(content={
+            "anomalies": summarized_anomalies,
+            "message": f"Success"
+        })
+        
+    except Exception as e:
+        print(f"[{datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')}] Critical Error processing anomaly report: {str(e)}")
+        # Provide a general error message for unexpected server-side issues
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail=f"An internal server error occurred while processing the anomaly report: {str(e)}")
+
+    
+@router.get("/get_system_context")
+async def get_system_context() -> JSONResponse:
+    """
+    Returns a concise, plain-text summary of the system's capabilities
+    regarding Broadside email transmission and ServerSage observability.
+    This context is optimized for LLM consumption, providing key facts
+    without verbose formatting, to efficiently inform the model about
+    the system's domain expertise.
     """
     context_text = """
-    ## **Our Expertise: Tackling Digital Infrastructure's Toughest Challenges**
+System Context:
+Our expertise covers robust, scalable solutions for critical business operations, focusing on mass digital communication (Broadside) and 360° IT observability (ServerSage).
 
-    At **[Your Company Name - if you want to add one here, otherwise omit]**, we specialize in developing robust, scalable solutions for critical business operations. For over a decade, our flagship SaaS product, **Broadside**, has empowered enterprises to overcome the most demanding challenges in mass digital communication. Complementing this, **ServerSage** provides unparalleled 360° observability across complex IT environments.
+Broadside: High-Volume Email Transmission
+Challenges Addressed:
+- Massive Email Surges: Handles hundreds of thousands of emails/hour, preventing delays.
+- Spam Reputation Risk: Manages millions of emails daily to avoid spam filters.
+- Unprecedented Scale & Orchestration: Supports distributed architectures for extreme email processing.
 
-    ---
+Broadside's Solutions:
+- Hyper-Parallel Processing: Uses massive parallel processing and distributed databases for colossal email data surges and tracking.
+- Centralized Control: Single console to control entire campaign flow.
+- Extreme Scalability & Optimization: Scales seamlessly to 50+ Linux servers; highly optimized for efficiency (single server can handle peak loads).
+- Resource Maximization: Stresses all four core resources (CPU, RAM, disk I/O, network) simultaneously, indicating truly high workload handling.
 
-    ## **Broadside: Mastering High-Volume Email Transmission** 🚀
-
-    Sending large volumes of emails reliably and efficiently presents formidable challenges that conventional corporate email systems simply can't handle.
-
-    ### **The Challenges We Solve:**
-
-    * **Massive Email Surges:** Corporate email systems falter under the pressure of hundreds of thousands of emails per hour, leading to delays that directly impact customer experience (e.g., delayed e-tickets).
-    * **Spam Reputation Risk:** Daily transmission of millions of emails without proper management inevitably triggers spam filters, jeopardizing legitimate communications and business viability.
-    * **Unprecedented Scale & Orchestration:** Processing, filtering, logging, and dispatching emails at such a scale requires sophisticated, distributed architectures. Relying on a few servers is insufficient; orchestrating dozens to seamlessly work as one demands exceptional scalability and cluster management.
-
-    ### **Broadside's Pioneering Solutions:**
-
-    Broadside is engineered from the ground up to defy the limitations of traditional email systems. It's a testament to over a decade of innovation, designed for unparalleled performance:
-
-    * **Hyper-Parallel Processing:** Broadside leverages **massive parallel processing** and **multiple distributed databases** to effortlessly manage colossal email data surges, maintaining complete fidelity and tracking every single message.
-    * **Centralized Control:** An intuitive console allows a single executive to **control the entire flow** of any campaign or one batch, providing comprehensive oversight regardless of the underlying server count.
-    * **Extreme Scalability & Optimization:** Running on a cluster of Linux servers, Broadside **scales seamlessly to 50+ servers** without performance degradation. Each server is meticulously optimized, so much so that even our largest corporate clients rarely utilize more than two servers at their peak, a testament to its efficiency.
-    * **Resource Maximization:** Broadside stands out as the *only* system we've designed where, given the right load, a single server is simultaneously **stressed on all four core resources**: CPU speed, RAM capacity, disk I/O speed, and network bandwidth, signifying its truly non-trivial workload handling.
-
-    ---
-
-    ## **ServerSage: Unified Observability for Heterogeneous Environments** 📊
-
-    ServerSage revolutionizes how you monitor your entire IT landscape, delivering a **360° view** across diverse applications, infrastructure, databases, and other appliances. Our platform consolidates real-time metrics, logs, and traces into one intuitive, unified dashboard.
-
-    ### **Key Capabilities:**
-
-    * **Agent-Based Monitoring:** Deploy **lightweight, easy-to-install collectors** that integrate seamlessly across all your environments—cloud, on-premise, and hybrid setups.
-    * **Real-Time Insights & Proactive Alerts:** Stay ahead of potential issues with **instant notifications** and **live analytics**. ServerSage precisely pinpoints problems, enabling you to address them before they escalate into critical incidents.
-    * **Intelligent Thresholding (Watermark-Based):** Receive alerts **only when they truly matter**. Our unique watermark-based thresholding ensures you focus solely on critical parameter deviations, eliminating notification fatigue from irrelevant noise.
-    * **Robust Open-Source Foundation:** Built upon **industry-leading open-source frameworks**, ServerSage offers the unparalleled reliability and flexibility required for modern, dynamic IT operations.
-    """
+ServerSage: Unified Observability for Heterogeneous Environments
+Key Capabilities:
+- Agent-Based Monitoring: Lightweight collectors for cloud, on-premise, hybrid.
+- Real-Time Insights & Proactive Alerts: Instant notifications and live analytics for problem pinpointing.
+- Intelligent Thresholding (Watermark-Based): Alerts only for critical parameter deviations, reducing noise.
+- Robust Open-Source Foundation: Built on industry-leading open-source frameworks for reliability and flexibility.
+"""
     return JSONResponse(content={"context": context_text})
+
+
 
 @router.post("/predict_anomaly")
 async def predict_anomaly_endpoint(data_point_request: DataPoint, request: Request): # Add request: Request
@@ -473,397 +550,212 @@ async def train_anomaly_model(request: TrainModelRequest):
             detail=f"Error during model training: {e}"
         )
 
+# In-memory cache for storing chart data
+chart_cache: Dict[str, Dict[str, Any]] = {}
+
+# Set up Jinja2 templates.
+templates = Jinja2Templates(directory="templates")
+
+
+# --- Pydantic Models for Data Validation ---
+
+# 3D Data Models
+class Series3DData(BaseModel):
+    x: List[Any]
+    y: List[Any]
+    z: List[Any]
+    name: str
+
+class Heatmap3DData(BaseModel):
+    x: List[Any]
+    y: List[Any]
+    z: List[List[Any]]
+    name: str = "3D Heatmap"
+
+# 2D Data Models
+class ChartDataPoint(BaseModel):
+    x: List[Any]
+    y: List[Any]
+    name: str
+
+class PieChartData(BaseModel):
+    labels: List[str]
+    values: List[float]
+    hole: float = 0.4
+    hoverinfo: str = "label+percent"
+
+# The main request model is now more comprehensive
 class ChartPlottingRequest(BaseModel):
-    """
-    Request payload for plotting charts using direct SVG generation.
-    Supports 'line', 'bar', 'scatter', 'area', 'stacked_bar', 'horizontal_bar' chart types.
-    """
-    # x_data can be numbers (for quantitative axes like scatter) or strings (for categorical labels)
-    x_data: List[Union[float, str]] = Field(..., description="Data points for the X-axis. Can be numerical for quantitative axes or strings for categorical labels.")
+    title: str = "Dynamic Data Visualization"
+    description: str = "A powerful, interactive chart generated on-demand."
+    chart_type: str = Field(..., description="The type of chart to render (e.g., 'line', 'bar', 'pie', 'scatter', 'heatmap').")
+    chart_data: Union[List[ChartDataPoint], PieChartData, List[Series3DData], Heatmap3DData] = Field(..., description="Data payload based on chart type.")
     
-    # y_data_series is always a list of lists, where each inner list is a series/layer.
-    # For single series charts (line, scatter, basic bar), provide as [[value1, value2, ...]]
-    y_data_series: List[List[float]] = Field(..., description="List of Y-axis data series. Each inner list is a series.")
-    
-    # Updated to include all 6 supported chart types
-    chart_type: Literal["line", "bar", "scatter", "area", "stacked_bar", "horizontal_bar"] = Field("line", description="Type of chart to generate.")
-    
-    title: Optional[str] = Field("Generated Chart", description="Title of the chart.")
-    x_label: Optional[str] = Field("X-Axis", description="Label for the X-axis.")
-    y_label: Optional[str] = Field("Y-Axis", description="Label for the Y-axis.")
-    
-    # Optional: labels for multiple series (e.g., for legend)
-    series_labels: Optional[List[str]] = Field(None, description="Optional labels for each data series, matching the order of y_data_series. Used for legend.") 
+    @classmethod
+    def __discriminator__(cls, v):
+        chart_type = v.get("chart_type")
+        if chart_type in ["line", "bar", "stacked_bar", "waterfall", "scatter"]:
+            return "chart_data"
+        elif chart_type == "pie":
+            return "chart_data"
+        elif chart_type in ["line3d", "bar3d", "scatter3d"]:
+            return "chart_data"
+        elif chart_type == "heatmap":
+            return "chart_data"
+        return None
 
-    # Aesthetic parameters for direct SVG
-    width: Optional[int] = Field(800, description="Width of the SVG chart in pixels.")
-    height: Optional[int] = Field(500, description="Height of the SVG chart in pixels.")
+# --- Helper Function for Chart Generation ---
+def generate_plotly_chart_definition(request_data: ChartPlottingRequest) -> Dict[str, Any]:
+    """Generates a Plotly chart definition with a futuristic theme."""
+    fig = go.Figure()
     
-    line_width: Optional[float] = Field(2.0, description="Line width for line/area charts.")
+    # A vibrant, futuristic color palette
+    color_palette = ['#00FFFF', '#FF00FF', '#FFFF00', '#00FF00', '#FF8C00', '#1E90FF', '#FF1493']
+
+    # --- Conditional Logic for All Supported Graph Types (2D & 3D) ---
+    chart_type_lower = request_data.chart_type.lower()
     
-    # For line/scatter charts: whether to draw markers
-    marker_style: Optional[bool] = Field(False, description="Whether to draw markers on line/scatter charts. (True/False).")
+    if chart_type_lower in ["line", "bar", "stacked_bar", "waterfall", "scatter"]:
+        # 2D charts with enhanced styles
+        if chart_type_lower == "line":
+            for i, series in enumerate(request_data.chart_data):
+                fig.add_trace(go.Scatter(x=series.x, y=series.y, mode='lines+markers', name=series.name,
+                    line=dict(color=color_palette[i % len(color_palette)], width=3, shape='spline'),
+                    marker=dict(size=10, color='white', line=dict(width=2, color=color_palette[i % len(color_palette)])),
+                    hoverinfo='x+y+name'
+                ))
+        elif chart_type_lower == "bar":
+            for i, series in enumerate(request_data.chart_data):
+                fig.add_trace(go.Bar(x=series.x, y=series.y, name=series.name,
+                    marker_color=color_palette[i % len(color_palette)],
+                    hoverinfo='x+y+name'
+                ))
+        elif chart_type_lower == "stacked_bar":
+            for i, series in enumerate(request_data.chart_data):
+                fig.add_trace(go.Bar(x=series.x, y=series.y, name=series.name,
+                    marker_color=color_palette[i % len(color_palette)],
+                    hoverinfo='x+y+name'
+                ))
+            fig.update_layout(barmode='stack')
+        elif chart_type_lower == "waterfall":
+            series = request_data.chart_data[0]
+            fig = go.Figure(go.Waterfall(x=series.x, y=series.y, name=series.name,
+                connector=dict(line=dict(color="#555555")),
+                increasing=dict(marker=dict(color='#2ECC71')),
+                decreasing=dict(marker=dict(color='#E74C3C')),
+                totals=dict(marker=dict(color='#3498DB')),
+                hoverinfo='x+y+name'
+            ))
+        elif chart_type_lower == "scatter":
+            for i, series in enumerate(request_data.chart_data):
+                fig.add_trace(go.Scatter(x=series.x, y=series.y, mode='markers', name=series.name,
+                    marker=dict(size=10, color=color_palette[i % len(color_palette)], line=dict(width=2, color='white')),
+                    hoverinfo='x+y+name'
+                ))
+        
+        # Apply 2D layout
+        fig.update_layout(
+            title_text=f"<b>{request_data.title}</b>",
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            font=dict(family='Roboto Mono, monospace', color='#F0F0F0', size=14),
+            xaxis=dict(title_text="X-Axis", showgrid=True, gridcolor='rgba(255,255,255,0.1)', linecolor='rgba(255,255,255,0.2)'),
+            yaxis=dict(title_text="Y-Axis", showgrid=True, gridcolor='rgba(255,255,255,0.1)', linecolor='rgba(255,255,255,0.2)'),
+            hovermode='closest'
+        )
 
-    # For area charts
-    fill_opacity: Optional[float] = Field(0.3, ge=0.0, le=1.0, description="Transparency for filled areas (0.0 to 1.0).")
+    elif chart_type_lower in ["line3d", "scatter3d", "bar3d", "heatmap"]:
+        # 3D charts with enhanced styles
+        if chart_type_lower == "line3d":
+            for i, series in enumerate(request_data.chart_data):
+                fig.add_trace(go.Scatter3d(x=series.x, y=series.y, z=series.z, mode='lines+markers', name=series.name,
+                    line=dict(color=color_palette[i % len(color_palette)], width=4),
+                    marker=dict(size=5, symbol='circle', color=color_palette[i % len(color_palette)]),
+                    hoverinfo='x+y+z+name'
+                ))
+        elif chart_type_lower == "scatter3d":
+            for i, series in enumerate(request_data.chart_data):
+                fig.add_trace(go.Scatter3d(x=series.x, y=series.y, z=series.z, mode='markers', name=series.name,
+                    marker=dict(size=6, symbol='circle', color=color_palette[i % len(color_palette)], opacity=0.9),
+                    hoverinfo='x+y+z+name'
+                ))
+        elif chart_type_lower == "bar3d":
+            for i, series in enumerate(request_data.chart_data):
+                fig.add_trace(go.Bar3d(x=series.x, y=series.y, z=series.z, name=series.name,
+                    marker=dict(color=color_palette[i % len(color_palette)], opacity=0.8),
+                    hoverinfo='x+y+z+name'
+                ))
+        elif chart_type_lower == "heatmap":
+            fig.add_trace(go.Surface(
+                x=request_data.chart_data.x, y=request_data.chart_data.y, z=request_data.chart_data.z,
+                colorscale='Viridis', colorbar_title="Value",
+                contours=dict(x=dict(show=True, project=dict(z=True))),
+                name=request_data.chart_data.name
+            ))
 
-    # For bar charts (bar, stacked_bar, horizontal_bar)
-    bar_gap_ratio: Optional[float] = Field(0.2, ge=0.0, le=1.0, description="Ratio of gap between bars to bar width within a category (0.0 to 1.0).")
-    
-    # Control for X-axis scaling: if x_data contains numbers but should be treated categorically, set to False.
-    x_axis_is_numeric: bool = Field(False, description="If true, x_data will be treated as numerical values for scaling (e.g., for true scatter plots); otherwise, it's treated as categorical labels where points are evenly spaced. Applicable for 'line' and 'scatter'.")
-
-
-# --- Updated Plotting Endpoint ---
-@router.post("/plot_chart", response_class=HTMLResponse)
-async def plot_chart_html(request: ChartPlottingRequest):
-    """
-    Generates an SVG chart (line, bar, scatter, area, stacked_bar, horizontal_bar) 
-    based on provided data, labels, and dimensions.
-    Returns the SVG content embedded in basic HTML.
-    """
-    if not request.y_data_series or not request.x_data:
-        raise HTTPException(status_code=400, detail="Missing x_data or y_data_series.")
-    
-    # Validate lengths
-    for series_index, y_values in enumerate(request.y_data_series):
-        if len(y_values) != len(request.x_data):
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Length of y_data_series[{series_index}] ({len(y_values)}) must match length of x_data ({len(request.x_data)})."
+        # Apply 3D layout
+        fig.update_layout(
+            title_text=f"<b>{request_data.title}</b>",
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            font=dict(family='Roboto Mono, monospace', color='#F0F0F0', size=14),
+            scene=dict(
+                xaxis={"gridcolor": 'rgba(0, 255, 255, 0.2)', "zerolinecolor": '#00FFFF'},
+                yaxis={"gridcolor": 'rgba(255, 0, 255, 0.2)', "zerolinecolor": '#FF00FF'},
+                zaxis={"gridcolor": 'rgba(255, 255, 0, 0.2)', "zerolinecolor": '#FFFF00'},
+                bgcolor='rgba(0,0,0,0)',
+                camera=dict(eye={"x": 1.5, "y": 1.5, "z": 0.8})
             )
-    if request.series_labels and len(request.series_labels) != len(request.y_data_series):
-        raise HTTPException(status_code=400, detail="Number of series_labels must match y_data_series.")
+        )
 
-    chart_type = request.chart_type.lower()
-    supported_chart_types = ["line", "bar", "scatter", "area", "stacked_bar", "horizontal_bar"]
-    if chart_type not in supported_chart_types:
-        raise HTTPException(status_code=400, detail=f"Chart type '{chart_type}' is not supported. Supported types: {', '.join(supported_chart_types)}.")
-
-    # Define SVG dimensions and padding
-    svg_width = request.width if request.width is not None else 800
-    svg_height = request.height if request.height is not None else 500
-    padding = 60 # Padding for axes and labels
-
-    # --- Determine Axis Scaling ---
-    # For horizontal bar charts, swap width/height roles for scaling
-    is_horizontal = (chart_type == "horizontal_bar")
-    plot_width = svg_width - 2 * padding
-    plot_height = svg_height - 2 * padding
-
-    # X-axis scaling (dynamic based on x_axis_is_numeric)
-    x_min_val, x_max_val = 0, len(request.x_data) - 1 # Default for categorical x-axis (index-based)
-    x_is_numeric_scale = request.x_axis_is_numeric and all(isinstance(val, (int, float)) for val in request.x_data)
-
-    if x_is_numeric_scale:
-        x_numeric_data = [float(x) for x in request.x_data]
-        if x_numeric_data:
-            x_min_val = min(x_numeric_data)
-            x_max_val = max(x_numeric_data)
-            # Add some buffer to x-axis range
-            x_range_buffer = (x_max_val - x_min_val) * 0.1
-            if x_range_buffer == 0: # Handle single point or all same x value
-                x_range_buffer = 1.0 # Default buffer for single point
-            x_min_val -= x_range_buffer
-            x_max_val += x_range_buffer
-            if x_max_val == x_min_val: x_max_val += 1.0 # Ensure range for single point
-        else: # If x_axis_is_numeric is true but x_data is empty, fallback
-            x_min_val, x_max_val = 0, 1
-
-
-    # Y-axis scaling (find min/max across all series)
-    all_y_values = [item for sublist in request.y_data_series for item in sublist]
-    if not all_y_values:
-        y_min_val, y_max_val = 0, 1 # Default if no data
-    elif chart_type in ["stacked_bar", "stacked_area"]: # Note: stacked_area is commented out in this version.
-        # Calculate max cumulative sum for stacked charts
-        max_positive_cumulative_y = 0
-        min_negative_cumulative_y = 0
-        for i in range(len(request.x_data)):
-            current_positive_sum = sum(y_series[i] for y_series in request.y_data_series if y_series[i] >= 0)
-            current_negative_sum = sum(y_series[i] for y_series in request.y_data_series if y_series[i] < 0)
-            if current_positive_sum > max_positive_cumulative_y:
-                max_positive_cumulative_y = current_positive_sum
-            if current_negative_sum < min_negative_cumulative_y:
-                min_negative_cumulative_y = current_negative_sum
-        
-        y_min_val = min_negative_cumulative_y # Can go negative for stacked
-        y_max_val = max_positive_cumulative_y
-
+    elif chart_type_lower == "pie":
+        # Pie chart with enhanced styles
+        fig.add_trace(go.Pie(
+            labels=request_data.chart_data.labels, values=request_data.chart_data.values,
+            name=request_data.title, hole=request_data.chart_data.hole,
+            marker_colors=color_palette, textinfo='label+percent',
+            insidetextorientation='radial'
+        ))
+        fig.update_traces(marker=dict(line=dict(color='#FFFFFF', width=2)))
+        fig.update_layout(
+            title_text=f"<b>{request_data.title}</b>",
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            font=dict(family='Roboto Mono, monospace', color='#F0F0F0', size=14)
+        )
+    
     else:
-        y_min_val = min(all_y_values)
-        y_max_val = max(all_y_values)
-
-    y_range_buffer = (y_max_val - y_min_val) * 0.1
-    if y_range_buffer == 0: # All identical values
-        y_max_scaled = y_max_val + 1.0 if y_max_val == 0 else y_max_val * 1.1
-        y_min_scaled = y_min_val - 1.0 if y_min_val == 0 else y_min_val * 0.9
-        if y_max_scaled == y_min_scaled: # Still identical, force a range
-            y_max_scaled += 1.0
-            y_min_scaled -= 1.0
-    else:
-        y_min_scaled = y_min_val - y_range_buffer
-        y_max_scaled = y_max_val + y_range_buffer
+        raise ValueError(f"Unsupported chart type: {request_data.chart_type}")
     
-    # Ensure range is not zero if single point or flat line
-    if y_max_scaled == y_min_scaled:
-        y_max_scaled += 1.0
-        y_min_scaled -= 1.0
+    return fig.to_json()
 
 
-    # Scaling functions to map data coordinates to SVG pixel coordinates
-    # For horizontal bar, x_data maps to Y-axis and y_data maps to X-axis
-    def scale_x_coord(val, for_axis_label=False): # Maps x_data value/index to SVG x-coordinate
-        if is_horizontal: # For horizontal bar, x_data maps to vertical position (y-axis)
-            idx = request.x_data.index(val) if not isinstance(val, int) else val
-            # Calculate position on Y-axis based on category index
-            return padding + plot_height - (idx / (len(request.x_data) - 1 if len(request.x_data) > 1 else 1)) * plot_height 
-        else: # Normal x-axis
-            if x_is_numeric_scale and not for_axis_label: # For actual data points (scatter/line)
-                return padding + ((val - x_min_val) / (x_max_val - x_min_val)) * plot_width
-            else: # Categorical x-axis or for label positioning
-                idx = request.x_data.index(val) if not isinstance(val, int) else val
-                return padding + (idx / (len(request.x_data) - 1 if len(request.x_data) > 1 else 1)) * plot_width
-
-    def scale_y_coord(val, for_axis_label=False): # Maps y_data value to SVG y-coordinate
-        if is_horizontal: # For horizontal bar, y_data maps to horizontal position (x-axis)
-            return padding + ((val - y_min_scaled) / (y_max_scaled - y_min_scaled)) * plot_width
-        else: # Normal y-axis
-            return (svg_height - padding) - ((val - y_min_scaled) / (y_max_scaled - y_min_scaled)) * plot_height
-
-    svg_elements = []
-    
-    # Define colors for series
-    colors = ["#3366cc", "#dc3912", "#ff9900", "#109618", "#990099", "#00bcd4", "#e91e63", "#66aa00", "#b82912", "#31659a"]
-
-    # Draw Axes Lines
-    # Horizontal charts swap X and Y axis conceptual roles for drawing.
-    # The 'y1' of the line for horizontal charts (Y-axis for categories) runs from top_padding to bottom_padding.
-    # The 'x1' of the line for horizontal charts (X-axis for values) runs from left_padding to right_padding.
-    
-    # Main axes (based on orientation)
-    if is_horizontal:
-        # X-axis (value axis)
-        svg_elements.append(f'<line x1="{padding}" y1="{svg_height - padding}" x2="{svg_width - padding}" y2="{svg_height - padding}" stroke="black" stroke-width="1"/>')
-        # Y-axis (category axis)
-        svg_elements.append(f'<line x1="{padding}" y1="{padding}" x2="{padding}" y2="{svg_height - padding}" stroke="black" stroke-width="1"/>')
-    else:
-        # Y-axis
-        svg_elements.append(f'<line x1="{padding}" y1="{padding}" x2="{padding}" y2="{svg_height - padding}" stroke="black" stroke-width="1"/>')
-        # X-axis
-        svg_elements.append(f'<line x1="{padding}" y1="{svg_height - padding}" x2="{svg_width - padding}" y2="{svg_height - padding}" stroke="black" stroke-width="1"/>')
-
-    # --- Axis Labels and Ticks ---
-    # X-axis (labels and ticks)
-    if not is_horizontal: # Normal vertical chart X-axis
-        num_x_labels = len(request.x_data)
-        for i, label_val in enumerate(request.x_data):
-            x_pos = scale_x_coord(label_val if x_is_numeric_scale else i, for_axis_label=True)
-            svg_elements.append(f'<text x="{x_pos}" y="{svg_height - padding + 15}" text-anchor="middle" font-size="10">{label_val}</text>')
-            svg_elements.append(f'<line x1="{x_pos}" y1="{svg_height - padding}" x2="{x_pos}" y2="{svg_height - padding + 5}" stroke="black" stroke-width="1"/>')
-            svg_elements.append(f'<line x1="{x_pos}" y1="{padding}" x2="{x_pos}" y2="{svg_height - padding}" stroke="#e0e0e0" stroke-width="0.5" stroke-dasharray="2,2"/>')
-    
-    # Y-axis (labels and ticks)
-    num_y_ticks = 5 # Number of ticks for the value axis
-    for i in range(num_y_ticks):
-        y_tick_val = y_min_scaled + (i / (num_y_ticks - 1)) * (y_max_scaled - y_min_scaled) if num_y_ticks > 1 else y_min_scaled
+# --- FastAPI Endpoints ---
+@router.post("/plot_chart")
+async def generate_chart_link(request_data: ChartPlottingRequest = Body(...)):
+    """Generates a chart definition, stores it, and returns a unique URL."""
+    try:
+        chart_definition_dict = json.loads(generate_plotly_chart_definition(request_data))
+        chart_definition_dict["description"] = request_data.description
         
-        if is_horizontal: # X-axis is value axis (y_label in request)
-            x_tick_pos = scale_y_coord(y_tick_val, for_axis_label=True) # Scale y_tick_val to X-pixel for horizontal
-            svg_elements.append(f'<text x="{x_tick_pos}" y="{svg_height - padding + 15}" text-anchor="middle" font-size="10">{y_tick_val:.2f}</text>')
-            svg_elements.append(f'<line x1="{x_tick_pos}" y1="{svg_height - padding}" x2="{x_tick_pos}" y2="{svg_height - padding + 5}" stroke="black" stroke-width="1"/>')
-            svg_elements.append(f'<line x1="{x_tick_pos}" y1="{padding}" x2="{x_tick_pos}" y2="{svg_height - padding}" stroke="#e0e0e0" stroke-width="0.5" stroke-dasharray="2,2"/>')
-        else: # Normal Y-axis (y_label in request)
-            y_pos = scale_y_coord(y_tick_val, for_axis_label=True)
-            svg_elements.append(f'<text x="{padding - 10}" y="{y_pos + 4}" text-anchor="end" font-size="10">{y_tick_val:.2f}</text>')
-            svg_elements.append(f'<line x1="{padding}" y1="{y_pos}" x2="{padding - 5}" y2="{y_pos}" stroke="black" stroke-width="1"/>')
-            svg_elements.append(f'<line x1="{padding}" y1="{y_pos}" x2="{svg_width - padding}" y2="{y_pos}" stroke="#e0e0e0" stroke-width="0.5" stroke-dasharray="2,2"/>')
+        chart_id = str(uuid.uuid4())
+        chart_cache[chart_id] = {"data": chart_definition_dict}
+        chart_url = f"/mcp/model_management/chart_viewer/{chart_id}"
+        return JSONResponse(content={"status": "success", "url": chart_url})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-    # Categorical Axis Labels (X-axis for vertical, Y-axis for horizontal)
-    if is_horizontal: # Y-axis is now categorical
-        # Calculate positions for categorical axis (y-axis for horizontal bar chart)
-        num_categories = len(request.x_data)
-        for i, label_val in enumerate(request.x_data):
-            y_pos_category = padding + plot_height - (i / (num_categories - 1 if num_categories > 1 else 1)) * plot_height
-            svg_elements.append(f'<text x="{padding - 10}" y="{y_pos_category + 4}" text-anchor="end" font-size="10">{label_val}</text>')
-            svg_elements.append(f'<line x1="{padding}" y1="{y_pos_category}" x2="{padding - 5}" y2="{y_pos_category}" stroke="black" stroke-width="1"/>')
-            svg_elements.append(f'<line x1="{padding}" y1="{y_pos_category}" x2="{svg_width - padding}" y2="{y_pos_category}" stroke="#e0e0e0" stroke-width="0.5" stroke-dasharray="2,2"/>')
-
-
-    # --- Plot Data Series ---
+@router.get("/chart_viewer/{chart_id}")
+async def chart_viewer(request: Request, chart_id: str):
+    """Renders the HTML page for a specific chart ID."""
+    chart_data_entry = chart_cache.get(chart_id)
+    if not chart_data_entry:
+        raise HTTPException(status_code=404, detail="Chart not found. The link may have expired.")
     
-    # Calculate zero line position for bar/area charts
-    # For vertical charts, this is a Y-coordinate. For horizontal, it's an X-coordinate.
-    zero_val_pos = scale_y_coord(0) 
-
-    if chart_type in ["line", "scatter", "area"]:
-        for i, y_values in enumerate(request.y_data_series):
-            current_color = colors[i % len(colors)]
-            points = []
-            
-            if chart_type == "area":
-                # Start path from the zero line (or min_scaled) at the first x-point
-                x_start_area = scale_x_coord(request.x_data[0] if x_is_numeric_scale else 0)
-                points.append(f"{x_start_area},{zero_val_pos}")
-
-            for j, y_val in enumerate(y_values):
-                x_val_for_point = request.x_data[j] if x_is_numeric_scale else j
-                x_pos = scale_x_coord(x_val_for_point)
-                y_pos = scale_y_coord(y_val)
-                points.append(f"{x_pos},{y_pos}")
-
-                if chart_type == "scatter" or (chart_type == "line" and request.marker_style):
-                    svg_elements.append(f'<circle cx="{x_pos}" cy="{y_pos}" r="4" fill="{current_color}" stroke="none"/>')
-
-            if points:
-                if chart_type == "line":
-                    path_d = "M " + " L ".join(points)
-                    svg_elements.append(f'<path d="{path_d}" stroke="{current_color}" stroke-width="{request.line_width}" fill="none"/>')
-                elif chart_type == "area":
-                    # Close the path back to the zero line at the last x-point
-                    x_end_area = scale_x_coord(request.x_data[-1] if x_is_numeric_scale else len(request.x_data) - 1)
-                    points.append(f"{x_end_area},{zero_val_pos}")
-                    path_d = "M " + " L ".join(points)
-                    svg_elements.append(f'<path d="{path_d}" fill="{current_color}" fill-opacity="{request.fill_opacity}" stroke="{current_color}" stroke-width="{request.line_width}"/>')
+    chart_definition_json = json.dumps(chart_data_entry["data"])
     
-    elif chart_type in ["bar", "stacked_bar"]:
-        num_categories = len(request.x_data)
-        total_series = len(request.y_data_series)
-        
-        # Calculate bar dimensions for vertical bars
-        category_total_width = plot_width / num_categories
-        bar_gap = category_total_width * (request.bar_gap_ratio if request.bar_gap_ratio is not None else 0.2)
-        
-        if chart_type == "bar": # Grouped bars
-            bar_width = (category_total_width - bar_gap) / total_series
-        else: # Stacked bars
-            bar_width = category_total_width - bar_gap # Each stack occupies this width
+    return templates.TemplateResponse(
+        "chart_viewer.html",
+        {"request": request, "chart_definition": chart_definition_json}
+    )
 
-        bar_width = max(1, bar_width) # Ensure minimum bar width
-
-        # Store current accumulated heights for stacked bars
-        if chart_type == "stacked_bar":
-            current_y_stack = [0.0] * num_categories # For positive stacks
-            current_y_stack_neg = [0.0] * num_categories # For negative stacks
-
-        for j in range(num_categories): # Iterate through each x_data point (category)
-            x_pos_category_center = scale_x_coord(j, for_axis_label=True) # Center of the current x-category
-            
-            if chart_type == "bar": # Grouped bars
-                # Calculate the starting X position for the first bar in this group
-                group_width_effective = (bar_width * total_series) + (bar_gap * (total_series - 1) * 0.5) # Slight adjustment for group centering
-                group_start_x = x_pos_category_center - (group_width_effective / 2)
-                
-                for i, y_values in enumerate(request.y_data_series): # Iterate through each series
-                    y_val = y_values[j]
-                    current_color = colors[i % len(colors)]
-                    
-                    x_rect_start = group_start_x + (i * bar_width)
-                    
-                    y_pos_top = scale_y_coord(y_val)
-                    bar_y_start = min(y_pos_top, zero_val_pos)
-                    bar_height = abs(y_pos_top - zero_val_pos)
-
-                    if bar_height < 0: bar_height = 0
-                    svg_elements.append(f'<rect x="{x_rect_start}" y="{bar_y_start}" width="{bar_width}" height="{bar_height}" fill="{current_color}" stroke="black" stroke-width="0.5"/>')
-            
-            elif chart_type == "stacked_bar":
-                x_rect_start = x_pos_category_center - (bar_width / 2)
-                for i, y_values in enumerate(request.y_data_series):
-                    y_val = y_values[j]
-                    current_color = colors[i % len(colors)]
-
-                    if y_val >= 0:
-                        y_pos_top = scale_y_coord(current_y_stack[j] + y_val)
-                        y_pos_bottom = scale_y_coord(current_y_stack[j])
-                        bar_y_start = y_pos_top
-                        bar_height = y_pos_bottom - y_pos_top
-                        current_y_stack[j] += y_val
-                    else: # Negative stack
-                        y_pos_top = scale_y_coord(current_y_stack_neg[j])
-                        y_pos_bottom = scale_y_coord(current_y_stack_neg[j] + y_val)
-                        bar_y_start = y_pos_top
-                        bar_height = y_pos_bottom - y_pos_top
-                        current_y_stack_neg[j] += y_val
-
-                    if bar_height < 0: bar_height = 0 # Ensure non-negative height
-                    svg_elements.append(f'<rect x="{x_rect_start}" y="{bar_y_start}" width="{bar_width}" height="{bar_height}" fill="{current_color}" stroke="black" stroke-width="0.5"/>')
-
-    elif chart_type == "horizontal_bar":
-        num_categories = len(request.x_data)
-        total_series = len(request.y_data_series)
-        
-        category_total_height = plot_height / num_categories
-        bar_gap = category_total_height * (request.bar_gap_ratio if request.bar_gap_ratio is not None else 0.2)
-
-        bar_height_per_series = (category_total_height - bar_gap) / total_series
-        bar_height_per_series = max(1, bar_height_per_series) # Ensure positive height
-
-        for j in range(num_categories): # Iterate through each x_data point (category for Y-axis)
-            y_pos_category_center = scale_x_coord(request.x_data[j], for_axis_label=True) # Center of the current y-category (which is x_data)
-            
-            # Calculate the starting Y position for the first bar in this group
-            group_height_effective = (bar_height_per_series * total_series) + (bar_gap * (total_series - 1) * 0.5)
-            group_start_y = y_pos_category_center - (group_height_effective / 2)
-
-            for i, y_values in enumerate(request.y_data_series): # Iterate through each series
-                y_val = y_values[j]
-                current_color = colors[i % len(colors)]
-                
-                y_rect_start = group_start_y + (i * bar_height_per_series)
-                
-                x_pos_end = scale_y_coord(y_val) # X-position of the bar's end (value axis)
-                bar_x_start = min(x_pos_end, zero_val_pos)
-                bar_width = abs(x_pos_end - zero_val_pos)
-
-                if bar_width < 0: bar_width = 0
-                svg_elements.append(f'<rect x="{bar_x_start}" y="{y_rect_start}" width="{bar_width}" height="{bar_height_per_series}" fill="{current_color}" stroke="black" stroke-width="0.5"/>')
-
-
-    # --- Axis Labels & Title ---
-    if is_horizontal:
-        svg_elements.append(f'<text x="{svg_width / 2}" y="{svg_height - 10}" text-anchor="middle" font-size="14">{request.y_label}</text>') # X-axis (values)
-        svg_elements.append(f'<text x="{15}" y="{svg_height / 2}" text-anchor="middle" transform="rotate(-90 {15},{svg_height / 2})" font-size="14">{request.x_label}</text>') # Y-axis (categories)
-    else:
-        svg_elements.append(f'<text x="{svg_width / 2}" y="{svg_height - 10}" text-anchor="middle" font-size="14">{request.x_label}</text>')
-        svg_elements.append(f'<text x="{15}" y="{svg_height / 2}" text-anchor="middle" transform="rotate(-90 {15},{svg_height / 2})" font-size="14">{request.y_label}</text>')
-
-    # Title
-    svg_elements.append(f'<text x="{svg_width / 2}" y="30" text-anchor="middle" font-size="18" font-weight="bold">{request.title}</text>')
-
-    # --- Basic Legend (optional, for multiple series) ---
-    if request.series_labels and len(request.y_data_series) > 0:
-        legend_start_x = svg_width - 150
-        legend_start_y = 50
-        for i, label in enumerate(request.series_labels):
-            color = colors[i % len(colors)]
-            svg_elements.append(f'<rect x="{legend_start_x}" y="{legend_start_y + i * 20}" width="15" height="15" fill="{color}"/>')
-            svg_elements.append(f'<text x="{legend_start_x + 20}" y="{legend_start_y + i * 20 + 12}" font-size="12">{label}</text>')
-
-
-    # Combine all SVG elements into a full SVG string
-    svg_content = f"""
-    <svg width="{svg_width}" height="{svg_height}" viewBox="0 0 {svg_width} {svg_height}" xmlns="http://www.w3.org/2000/svg">
-        <rect x="0" y="0" width="{svg_width}" height="{svg_height}" fill="white"/>
-        {" ".join(svg_elements)}
-    </svg>
-    """
-
-    # Final HTML with embedded SVG
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>{request.title}</title>
-        <style>
-            body {{ font-family: sans-serif; text-align: center; margin: 20px; }}
-            svg {{ border: 1px solid #ccc; background-color: #f9f9f9; box-shadow: 2px 2px 8px rgba(0,0,0,0.1); }}
-        </style>
-    </head>
-    <body>
-        <h1>{request.title}</h1>
-        {svg_content}
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html)
